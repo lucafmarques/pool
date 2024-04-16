@@ -57,6 +57,7 @@ func New(max, cap int, opts ...Option) *Pool {
 	var timeout = 10 * time.Second
 
 	pool := &Pool{
+		strategy:    Eager(),
 		maxWorkers:  max,
 		maxCapacity: cap,
 		idleTimeout: timeout,

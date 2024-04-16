@@ -6,11 +6,11 @@ import (
 )
 
 func worker(ctx context.Context, wg *sync.WaitGroup, first func(), tasks <-chan func(), executor func(func(), bool)) {
-	defer wg.Done()
-
 	if first != nil {
 		executor(first, true)
 	}
+
+	defer wg.Done()
 
 	for {
 		select {
