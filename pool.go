@@ -104,6 +104,25 @@ func (p *Pool) TrySubmit(task func()) bool {
 	return p.submit(task, false)
 }
 
+func (p *Pool) WaitSubmit(task func()) {
+	if task == nil {
+		return
+	}
+
+	done := make(chan struct{})
+	p.Submit(func() {
+		task()
+		close(done)
+	})
+	<-done
+}
+
+func (p *Pool) Group() *Group {
+	return &Group{
+		pool: p,
+	}
+}
+
 func (p *Pool) ActiveWorkers() int {
 	return int(atomic.LoadUint32(&p.activeWorkerCount))
 }
@@ -136,13 +155,13 @@ func (p *Pool) incrementWorkers() bool {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	active := int(atomic.LoadUint32(&p.activeWorkerCount))
+	active := p.ActiveWorkers()
 
 	if active >= p.maxWorkers {
 		return false
 	}
 
-	if active >= p.minWorkers && active > 0 && int(atomic.LoadUint32(&p.idleWorkerCount)) > 0 {
+	if active >= p.minWorkers && active > 0 && p.IdleWorkers() > 0 {
 		return false
 	}
 
