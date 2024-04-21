@@ -8,26 +8,6 @@ import (
 	"time"
 )
 
-type Option func(*Pool)
-
-func WithContext(ctx context.Context) Option {
-	return func(p *Pool) {
-		p.ctx = ctx
-	}
-}
-
-func WithPanicHandler(handler func(any)) Option {
-	return func(p *Pool) {
-		p.panicHandler = handler
-	}
-}
-
-func WithStrategy(strategy Strategy) Option {
-	return func(p *Pool) {
-		p.strategy = strategy
-	}
-}
-
 type Pool struct {
 	// Atomic counters
 	activeWorkerCount uint32
@@ -36,34 +16,41 @@ type Pool struct {
 	submittedCount    uint64
 	failedCount       uint64
 	successfulCount   uint64
+	stopped           uint64
+
 	// Configurable options
+	idleTimeout  time.Duration
+	maxCapacity  int
 	maxWorkers   int
 	minWorkers   int
-	maxCapacity  int
-	strategy     Strategy
-	idleTimeout  time.Duration
-	panicHandler func(any)
+	strat        Strategy
 	ctx          context.Context
 	ctxcancel    context.CancelFunc
+	panicHandler func(any)
+
 	// Privates
-	close    sync.Once
 	tasks    chan func()
+	mutex    sync.Mutex
 	tasksWG  sync.WaitGroup
 	workerWG sync.WaitGroup
-	mutex    sync.Mutex
+	close    sync.Once
 }
 
-func New(max, cap int, opts ...Option) *Pool {
+func New(ctx context.Context, opts ...Option) *Pool {
 	var timeout = 10 * time.Second
 
 	pool := &Pool{
-		strategy:    Eager(),
-		maxWorkers:  max,
-		maxCapacity: cap,
+		strat:       Eager(),
+		maxWorkers:  int(^uint(0) >> 1),
+		maxCapacity: int(^uint(0) >> 1),
 		idleTimeout: timeout,
 		panicHandler: func(panic any) {
 			fmt.Printf("worker panicked: %v", panic)
 		},
+	}
+
+	for _, opt := range opts {
+		opt(pool)
 	}
 
 	if pool.maxWorkers < 1 {
@@ -83,13 +70,19 @@ func New(max, cap int, opts ...Option) *Pool {
 	}
 
 	if pool.ctx == nil {
-		WithContext(context.Background())(pool)
+		pool.ctx = context.Background()
 	}
+
+	if pool.ctxcancel == nil {
+		pool.ctx, pool.ctxcancel = context.WithCancel(pool.ctx)
+	}
+
+	go pool.clean()
 
 	pool.tasks = make(chan func(), pool.maxCapacity)
 	if pool.minWorkers > 0 {
 		for range pool.minWorkers {
-			pool.work(nil)
+			pool.work(pool.ctx, nil)
 		}
 	}
 
@@ -97,11 +90,11 @@ func New(max, cap int, opts ...Option) *Pool {
 }
 
 func (p *Pool) Submit(task func()) {
-	p.submit(task, true)
+	p.submit(p.ctx, true, task)
 }
 
 func (p *Pool) TrySubmit(task func()) bool {
-	return p.submit(task, false)
+	return p.submit(p.ctx, false, task)
 }
 
 func (p *Pool) WaitSubmit(task func()) {
@@ -117,18 +110,27 @@ func (p *Pool) WaitSubmit(task func()) {
 	<-done
 }
 
-func (p *Pool) Group() *Group {
-	return &Group{
-		pool: p,
-	}
+func (p *Pool) Stop() {
+	go p.stop(false)
 }
 
-func (p *Pool) ActiveWorkers() int {
-	return int(atomic.LoadUint32(&p.activeWorkerCount))
+func (p *Pool) WaitStop() {
+	p.stop(true)
+}
+
+func (p *Pool) Group(ctx context.Context) *Group {
+	return &Group{
+		pool: p,
+		ctx:  ctx,
+	}
 }
 
 func (p *Pool) IdleWorkers() int {
 	return int(atomic.LoadUint32(&p.idleWorkerCount))
+}
+
+func (p *Pool) ActiveWorkers() int {
+	return int(atomic.LoadUint32(&p.activeWorkerCount))
 }
 
 func (p *Pool) PendingTasks() int {
@@ -151,6 +153,10 @@ func (p *Pool) FinishedTasks() int {
 	return p.FailedTasks() + p.SuccessfulTasks()
 }
 
+func (p *Pool) Stopped() bool {
+	return atomic.LoadUint64(&p.stopped) == 1
+}
+
 func (p *Pool) incrementWorkers() bool {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
@@ -165,7 +171,7 @@ func (p *Pool) incrementWorkers() bool {
 		return false
 	}
 
-	if !p.strategy.Resize(int(p.activeWorkerCount), p.minWorkers, p.maxWorkers) {
+	if !p.strat.Resize(int(p.activeWorkerCount), p.minWorkers, p.maxWorkers) {
 		return false
 	}
 
@@ -175,7 +181,23 @@ func (p *Pool) incrementWorkers() bool {
 	return true
 }
 
-func (p *Pool) submit(task func(), must bool) (sent bool) {
+func (p *Pool) decrementWorkers() bool {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if p.IdleWorkers() <= 0 || p.ActiveWorkers() <= p.minWorkers || p.Stopped() {
+		return false
+	}
+
+	atomic.AddUint32(&p.idleWorkerCount, ^uint32(0))
+	atomic.AddUint32(&p.activeWorkerCount, ^uint32(0))
+
+	p.tasks <- nil
+
+	return true
+}
+
+func (p *Pool) submit(ctx context.Context, must bool, task func()) (sent bool) {
 	if task == nil {
 		return false
 	}
@@ -192,7 +214,7 @@ func (p *Pool) submit(task func(), must bool) (sent bool) {
 		}
 	}()
 
-	if sent = p.work(task); sent {
+	if sent = p.work(ctx, task); sent {
 		return sent
 	}
 
@@ -209,7 +231,7 @@ func (p *Pool) submit(task func(), must bool) (sent bool) {
 	return true
 }
 
-func (p *Pool) work(task func()) bool {
+func (p *Pool) work(ctx context.Context, task func()) bool {
 	if !p.incrementWorkers() {
 		return false
 	}
@@ -218,7 +240,7 @@ func (p *Pool) work(task func()) bool {
 		atomic.AddUint32(&p.idleWorkerCount, 1)
 	}
 
-	go worker(p.ctx, &p.workerWG, task, p.tasks, p.execute)
+	go worker(ctx, &p.workerWG, task, p.tasks, p.execute)
 
 	return true
 }
@@ -242,4 +264,41 @@ func (p *Pool) execute(task func(), first bool) {
 
 	atomic.AddUint64(&p.successfulCount, 1)
 	atomic.AddUint32(&p.idleWorkerCount, 1)
+}
+
+func (p *Pool) clean() {
+	p.workerWG.Add(1)
+	defer p.workerWG.Done()
+
+	ticker := time.NewTicker(p.idleTimeout)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			p.decrementWorkers()
+		case <-p.ctx.Done():
+			return
+		}
+	}
+}
+
+func (p *Pool) stop(wait bool) {
+	atomic.StoreUint64(&p.stopped, 1)
+
+	if wait {
+		p.tasksWG.Wait()
+	}
+
+	p.mutex.Lock()
+	atomic.StoreUint32(&p.activeWorkerCount, 0)
+	atomic.StoreUint32(&p.idleWorkerCount, 0)
+	p.mutex.Unlock()
+
+	p.ctxcancel()
+
+	p.workerWG.Wait()
+	p.close.Do(func() {
+		close(p.tasks)
+	})
 }
